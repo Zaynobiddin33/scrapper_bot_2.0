@@ -1,0 +1,63 @@
+scrapper.py:1032:SB
+--------------------------------------------------------------------
+Last Page: [WARNING! Browser Not Open!]
+ Duration: 116.71s
+  Browser: Chrome 145.0.7632.160
+   Driver: chromedriver 145.0.7632.117
+Timestamp: 1773429353  (Unix Timestamp)
+     Date: Saturday, 14 March 2026
+     Time: 12:15:53 AM  (West Asia Standard Time, UTC+05:00)
+--------------------------------------------------------------------
+Traceback:
+  Traceback (most recent call last):
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\scrapper.py", line 507, in visit_with_proxy
+    simulate_human_behavior(sb, visit_id, min_duration=15)
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\scrapper.py", line 216, in simulate_human_behavior
+    cdp_move_mouse(sb, cur_x, cur_y)
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\scrapper.py", line 164, in cdp_move_mouse
+    sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\seleniumbase\fixtures\base_case.py", line 3501, in execute_cdp_cmd
+    return self.driver.execute_cdp_cmd(script, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\seleniumbase\core\browser_launcher.py", line 6013, in <lambda>
+    lambda *args, **kwargs: uc_execute_cdp_cmd(
+                            ^^^^^^^^^^^^^^^^^^^
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\seleniumbase\core\browser_launcher.py", line 471, in uc_execute_cdp_cmd
+    return driver.default_execute_cdp_cmd(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\selenium\webdriver\chromium\webdriver.py", line 144, in execute_cdp_cmd
+    return super().execute_cdp_cmd(cmd, cmd_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 409, in execute_cdp_cmd
+    return self.execute("executeCdpCommand", {"cmd": cmd, "params": cmd_args})["value"]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 432, in execute
+    self.error_handler.check_response(response)
+  File "D:\ACTIVE\Fun\Scrapper_bot-main\env\Lib\site-packages\selenium\webdriver\remote\errorhandler.py", line 232, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.InvalidSessionIdException: Message: invalid session id: session deleted as the browser has closed the connection
+from disconnected: Unable to receive message from renderer
+  (Session info: chrome=145.0.7632.160); For documentation on this error, please visit: https://www.selenium.dev/documentation/webdriver/troubleshooting/errors#invalidsessionidexception
+Stacktrace:
+Symbols not available. Dumping unresolved backtrace:
+	0x7ff6cf8daa55
+	0x7ff6cf638630
+	0x7ff6cf3cd75d
+	0x7ff6cf3ba3d9
+	0x7ff6cf3ba0c1
+	0x7ff6cf3b8e86
+	0x7ff6cf3de1cf
+	0x7ff6cf4757e4
+	0x7ff6cf419098
+	0x7ff6cf419f83
+	0x7ff6cf907810
+	0x7ff6cf901afd
+	0x7ff6cf922c1a
+	0x7ff6cf653345
+	0x7ff6cf65b81c
+	0x7ff6cf641924
+	0x7ff6cf641ad6
+	0x7ff6cf627e47
+	0x7ffd64c6e8d7
+	0x7ffd65d4c48c
+
