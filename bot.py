@@ -320,11 +320,15 @@ async def start_run_execute(message: types.Message, state: FSMContext):
     # Dynamic delay calculator
     def calc_delay() -> float:
         if deadline is None:
-            return 8.0  # default 8s per task per worker
+            return 8.0  # your old default
+        
         remaining_secs = max(1, (deadline - datetime.now()).total_seconds())
         remaining_tasks = max(1, _active_dispatcher.remaining)
+        # No artificial 120s cap when we actually need slower pace
         delay = remaining_secs / remaining_tasks * num_workers
-        return max(1.0, min(delay, 120.0))
+        delay = max(1.0, min(delay, 600.0))  # allow up to 10 minutes if needed
+        # Only enforce minimum (never sleep less than 1s)
+        return max(1.0, delay)
 
     deadline_str = deadline.strftime("%H:%M") if deadline else "auto"
     eta = ""
