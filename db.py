@@ -10,8 +10,12 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.db")
 
 
 async def init_db():
-    """Create tasks table if it doesn't exist."""
+    """Create tasks table if it doesn't exist. Enable WAL for concurrent performance."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # WAL mode: readers never block writers, writers never block readers.
+        # Critical for 5 parallel workers hitting increment_click() simultaneously.
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")  # wait up to 5s on lock instead of failing
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +57,7 @@ async def increment_click(task_id: int) -> bool:
     Explicit BEGIN IMMEDIATE wraps the entire read-modify-write as one transaction.
     """
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
         # Explicit transaction — locks DB from first statement to COMMIT
         await db.execute("BEGIN IMMEDIATE")
         try:

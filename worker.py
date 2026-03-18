@@ -454,15 +454,17 @@ async def flush_and_verify(page: Page) -> str:
 
 
 # ==================== SINGLE VISIT ====================
-async def visit_url(pw: Playwright, task: dict, worker_id: int) -> bool:
+async def visit_url(pw: Playwright, task: dict, worker_id: int) -> tuple[bool, float]:
     """
     One visit = one fresh browser (with browser-level proxy) + one context (fingerprint).
     Browser-level proxy is 100% reliable (unlike experimental per-context proxy).
+    Returns (success, elapsed_seconds).
     """
     proxy = new_proxy()
     fp = random_fingerprint()
     domain = urlparse(task['url']).netloc.replace("www.", "")
     browser: Browser | None = None
+    visit_start = time.time()
 
     try:
         # Launch browser WITH proxy at browser level — this is the fix for about:blank
@@ -505,7 +507,7 @@ async def visit_url(pw: Playwright, task: dict, worker_id: int) -> bool:
             await page.goto(task['url'], wait_until="domcontentloaded", timeout=40000)
         except Exception as e:
             print(f"  [W{worker_id}] Navigate failed: {e}")
-            return False
+            return False, time.time() - visit_start
 
         # Wait for full page load
         try:
@@ -521,10 +523,10 @@ async def visit_url(pw: Playwright, task: dict, worker_id: int) -> bool:
             current_url = page.url
             if "about:blank" in current_url:
                 print(f"  [W{worker_id}] Still about:blank — proxy likely failed")
-                return False
+                return False, time.time() - visit_start
             if "404" in title.lower() or any(k in current_url.lower() for k in ["blocked", "forbidden"]):
                 print(f"  [W{worker_id}] Blocked/404: {current_url[:50]}")
-                return False
+                return False, time.time() - visit_start
         except Exception:
             pass
 
@@ -550,17 +552,29 @@ async def visit_url(pw: Playwright, task: dict, worker_id: int) -> bool:
         print(f"  [W{worker_id}] OK {task['url'][:45]}... {elapsed:.0f}s {actions}act {status}")
 
         await increment_click(task['id'])
-        return True
+        return True, time.time() - visit_start
 
     except Exception as e:
         print(f"  [W{worker_id}] FAIL {task['url'][:45]}... {e}")
-        return False
+        return False, time.time() - visit_start
     finally:
-        if browser:
-            try:
+        # Explicit cleanup order: page → context → browser
+        # This prevents orphan Chromium helper processes from accumulating
+        try:
+            if browser:
+                for ctx in browser.contexts:
+                    for pg in ctx.pages:
+                        try:
+                            await pg.close()
+                        except Exception:
+                            pass
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
                 await browser.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 # ==================== WORKER LOOP ====================
@@ -569,6 +583,7 @@ async def worker_loop(
     dispatcher: Dispatcher,
     worker_id: int,
     get_delay: Callable[[], float],
+    visit_durations: list[float] | None = None,
 ):
     """Single async worker: pull task -> launch browser -> visit -> close -> cooldown."""
     while True:
@@ -579,12 +594,26 @@ async def worker_loop(
         if task is None:
             break
 
-        success = await visit_url(pw, task, worker_id)
+        # Resilient visit — worker survives any unexpected crash
+        try:
+            success, elapsed = await visit_url(pw, task, worker_id)
+        except Exception as e:
+            print(f"  [W{worker_id}] UNEXPECTED ERROR: {e}")
+            success, elapsed = False, 30.0  # fallback estimate
+
+        if visit_durations is not None:
+            visit_durations.append(elapsed)
 
         if not success and not dispatcher.is_stopped:
             print(f"  [W{worker_id}] Retrying...")
             await asyncio.sleep(random.uniform(2, 4))
-            success = await visit_url(pw, task, worker_id)
+            try:
+                success, elapsed = await visit_url(pw, task, worker_id)
+            except Exception as e:
+                print(f"  [W{worker_id}] RETRY CRASH: {e}")
+                success, elapsed = False, 30.0
+            if visit_durations is not None:
+                visit_durations.append(elapsed)
             if not success:
                 print(f"  [W{worker_id}] Retry failed, skipping")
 
@@ -604,11 +633,16 @@ async def run_workers(
     num_workers: int = 5,
     get_delay: Callable[[], float] = lambda: 8.0,
     on_progress: Callable | None = None,
+    visit_durations: list[float] | None = None,
 ):
     """
     Launch playwright instance + N async workers.
     Each worker manages its own browser lifecycle (browser-level proxy).
+    visit_durations: shared mutable list where workers append per-visit elapsed times.
     """
+    if visit_durations is None:
+        visit_durations = []
+
     async with async_playwright() as pw:
         total = dispatcher.total
         print(f"Playwright ready. {num_workers} workers, {total} tasks queued.")
@@ -631,7 +665,9 @@ async def run_workers(
 
         # Each worker gets the playwright instance (pw), not a shared browser
         workers = [
-            asyncio.create_task(worker_loop(pw, dispatcher, i + 1, get_delay))
+            asyncio.create_task(
+                worker_loop(pw, dispatcher, i + 1, get_delay, visit_durations)
+            )
             for i in range(num_workers)
         ]
 
