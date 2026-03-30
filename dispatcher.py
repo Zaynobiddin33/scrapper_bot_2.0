@@ -13,6 +13,7 @@ class Dispatcher:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = False
         self._total = 0
+        self._completed = 0
 
     async def build_queue(self) -> int:
         """
@@ -38,6 +39,7 @@ class Dispatcher:
             await self._queue.put(item)
 
         self._total = len(flat)
+        self._completed = 0
         return self._total
 
     async def next_task(self) -> dict | None:
@@ -45,8 +47,10 @@ class Dispatcher:
         if self._stop:
             return None
         try:
-            return self._queue.get_nowait()
-        except asyncio.QueueEmpty:
+            # Try to get a task with a very brief timeout to handle race conditions
+            # This prevents multiple workers from all exiting when the queue is nearly empty
+            return await asyncio.wait_for(self._queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
             return None
 
     def stop(self):
@@ -71,6 +75,14 @@ class Dispatcher:
     def total(self) -> int:
         return self._total
 
+    def mark_completed(self):
+        """Record one finished click-job."""
+        self._completed += 1
+
     @property
     def completed(self) -> int:
-        return self._total - self._queue.qsize()
+        return self._completed
+
+    def all_tasks_done(self) -> bool:
+        """Check if all tasks have been completed."""
+        return self._completed >= self._total

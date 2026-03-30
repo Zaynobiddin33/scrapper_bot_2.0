@@ -586,13 +586,25 @@ async def worker_loop(
     visit_durations: list[float] | None = None,
 ):
     """Single async worker: pull task -> launch browser -> visit -> close -> cooldown."""
+    consecutive_none_count = 0
+    max_none_before_exit = 2  # Exit only after 2 consecutive None returns
+
     while True:
         if dispatcher.is_stopped:
             break
 
         task = await dispatcher.next_task()
         if task is None:
-            break
+            consecutive_none_count += 1
+            if consecutive_none_count >= max_none_before_exit:
+                # Exit only after confirming no more tasks are available
+                break
+            else:
+                # Brief pause before checking again
+                await asyncio.sleep(0.05)
+                continue
+        
+        consecutive_none_count = 0  # Reset counter when we get a task
 
         # Resilient visit — worker survives any unexpected crash
         try:

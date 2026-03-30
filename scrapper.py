@@ -8,7 +8,7 @@ from datetime import datetime
 from contextlib import contextmanager
 import uuid
 import psutil
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import tempfile
 import shutil
 import threading
@@ -16,6 +16,11 @@ import threading
 # ==================== CONFIG & GLOBALS ====================
 VISIT_TIMEOUT_SECONDS = 120  # tighter timeout since visits are faster now
 STOP_FLAG = False
+
+# Import new modules
+import session_manager as sm
+import device_profiles as dp
+import navigation_pipeline as np
 
 
 @contextmanager
@@ -509,7 +514,7 @@ def visit_with_proxy(proxy: dict, target: str, visit_id: int) -> bool:
             if STOP_FLAG:
                 return False
 
-            # ---- STEP 5: Flush Metrica + verify ----
+            # ---- STEP 5: Flush Metrica + verify (single check, not triple) ----
             with step_timer(visit_id, "Flush + verify"):
                 try:
                     sb.execute_script("""
