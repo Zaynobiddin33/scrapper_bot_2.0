@@ -5,6 +5,7 @@ scrp_v2.py - Human-like browser automation with:
 - 100-120 second maximum browser lifetime
 - Dynamic behavior based on page characteristics
 """
+import json
 import random
 import threading
 import time
@@ -14,6 +15,9 @@ from urllib.parse import urlparse
 from seleniumbase import SB
 
 from tokens import PASSWORD, PROXY_HOST, PROXY_PORT, USERNAME
+
+from cookie_store import get_cookie_replay_plan, save_cookies_from_browser
+from device_profiles import pick_profile
 
 # Global stop flag - use with caution in async context
 STOP_FLAG = False
@@ -41,18 +45,49 @@ BLOCK_PAGE_KEYWORDS = (
     "temporarily unavailable",
 )
 
-# Browser lifetime limits - shorter to prevent hanging
-BROWSER_MIN_LIFETIME = 30   # Minimum seconds browser stays alive
-BROWSER_MAX_LIFETIME = 45   # Maximum seconds browser stays alive (reduced from 120)
-BROWSER_MAX_AGE = BROWSER_MAX_LIFETIME  # Browser restarts after this age
+# Session duration: NO hard floor/ceiling — use a natural distribution.
+# Real users: 15% bounce in <20s, 50% read 30-90s, 35% stay 90-180s.
+# A uniform 30-45s window is statistically impossible for humans and is
+# one of the primary signals Metrika's fraud ML detects.
+#
+# visit_duration() below samples from this weighted distribution each visit.
+BROWSER_MIN_LIFETIME = 0    # Unused — kept for import compatibility
+BROWSER_MAX_LIFETIME = 180  # Hard ceiling; visit_duration() picks within range
 
 # Metrika hit detection
 METRIKA_HIT_TIMEOUT = 15  # Wait up to 15s for Metrika hit
-MIN_VISIT_TOTAL = 25       # Minimum total visit time
+MIN_VISIT_TOTAL = 15       # Absolute minimum seconds before closing
 HUMAN_DURATION_VARIANCE = 3  # Additional human-like duration variance
 
-# Timeout for overall visit to prevent hanging (reduced from 120s to 60s)
-VISIT_TIMEOUT = 120  # Maximum time for a single visit to prevent hanging browsers
+# Timeout for overall visit to prevent hanging
+VISIT_TIMEOUT = 200  # Maximum time for a single visit to prevent hanging browsers
+
+SECURITY_VERIFICATION_SELECTOR = "p#jxHnX1.ch-description.spacer-top"
+SECURITY_VERIFICATION_TEXT = (
+    "This website uses a security service to protect against malicious bots. "
+    "This page is displayed while the website verifies you are not a bot."
+)
+
+
+def visit_duration() -> float:
+    """
+    Sample a session duration that matches real human visit-length distribution.
+
+    Segments (approximate real-user CDF from web analytics data):
+      ~20% bounce  :  12 – 22 s   (glanced, left)
+      ~45% medium  :  30 – 90 s   (read the article, skimmed)
+      ~25% engaged :  90 – 150 s  (read thoroughly, scrolled)
+      ~10% deep    : 150 – 200 s  (long read, multiple sections)
+    """
+    bucket = random.random()
+    if bucket < 0.20:
+        return random.uniform(12, 22)   # bounce
+    elif bucket < 0.65:
+        return random.uniform(30, 90)   # medium
+    elif bucket < 0.90:
+        return random.uniform(90, 150)  # engaged
+    else:
+        return random.uniform(150, 200) # deep read
 
 # Scrolling patterns for realistic human behavior
 SCROLL_PATTERNS = {
@@ -152,6 +187,19 @@ def _sleep_interruptible(duration: float, step: float = 0.2) -> bool:
 def _sleep_range(delay_range: tuple[float, float]) -> bool:
     """Sleep with random duration from range."""
     return _sleep_interruptible(random.uniform(*delay_range))
+
+
+def _inject_cookies(sb: SB, cookies: list[dict]) -> int:
+    """Inject cookies via CDP and count successful writes."""
+    injected = 0
+    for cookie in cookies:
+        try:
+            result = sb.execute_cdp_cmd("Network.setCookie", cookie) or {}
+            if result.get("success", True):
+                injected += 1
+        except Exception:
+            pass
+    return injected
 
 
 def _page_looks_blocked(sb: SB) -> bool:
@@ -319,19 +367,20 @@ def _perform_human_like_scroll(sb: SB, scroll_pattern: list) -> bool:
         if not _sleep_interruptible(actual_delay + reading_pause):
             return False
     
-    # Final scroll to bottom if we haven't reached it
-    try:
-        max_scroll = sb.execute_script("return document.body.scrollHeight - window.innerHeight")
-        current_pos = sb.execute_script("return window.scrollY")
-        
-        if max_scroll > 0 and current_pos < max_scroll * 0.8:
-            # Final scroll to bottom with natural delay
-            sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-            _sleep_range((1.0, 2.0))
-            print("[SCROLL] Reached bottom of page")
-    except Exception:
-        pass
-    
+    # Only scroll to the very bottom ~30% of the time.
+    # Real users often leave before reaching the bottom — forcing
+    # 100% bottom-reach is a statistical bot signal Metrika detects.
+    if random.random() < 0.30:
+        try:
+            max_scroll = sb.execute_script("return document.body.scrollHeight - window.innerHeight")
+            current_pos = sb.execute_script("return window.scrollY")
+            if max_scroll > 0 and current_pos < max_scroll * 0.8:
+                sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+                _sleep_range((1.0, 2.0))
+                print("[SCROLL] Reached bottom of page")
+        except Exception:
+            pass
+
     print("[SCROLL] Human-like scroll completed")
     return True
 
@@ -428,66 +477,76 @@ def _metrika_loaded(sb: SB) -> bool:
 
 
 def _trigger_metrika(sb: SB) -> bool:
-    """Trigger Metrika tracking with params."""
+    """
+    Check whether Metrika counters are present on the page.
+
+    NOTE: We deliberately do NOT call ym(id, 'params', {__ym:{visit:1}}).
+    That synthetic JS call is a detectable bot signal — Yandex's fraud ML
+    recognises it. The page-view hit fires automatically on load; we just
+    need to confirm the counter exists, then wait for the natural hit.
+    """
     try:
-        triggered = sb.execute_script(
+        counter_count = sb.execute_script(
             """
             var ids = new Set();
-            if (typeof window.ym === 'function') {
-                if (window.Ya && window.Ya._metrika && window.Ya._metrika.counters) {
-                    Object.keys(window.Ya._metrika.counters).forEach(function(id) {
-                        ids.add(parseInt(id, 10));
-                    });
-                }
+            if (window.Ya && window.Ya._metrika && window.Ya._metrika.counters) {
+                Object.keys(window.Ya._metrika.counters).forEach(function(id) {
+                    ids.add(id);
+                });
             }
             Object.keys(window).forEach(function(key) {
-                var match = /^yaCounter(\\d+)$/.exec(key);
-                if (match) {
-                    ids.add(parseInt(match[1], 10));
-                }
-            });
-            ids.forEach(function(id) {
-                try {
-                    window.ym(id, 'params', {__ym:{visit:1}});
-                } catch(e) {}
+                if (/^yaCounter\\d+$/.test(key)) ids.add(key);
             });
             return ids.size;
             """
         )
-        return bool(triggered)
+        return bool(counter_count)
     except Exception:
         return False
 
 
 def _has_metrika_hit_signal(sb: SB) -> bool:
-    """Check several browser-visible signals that a Metrika hit fired."""
+    """
+    Check multiple signals that a Yandex Metrika hit fired.
+
+    Signal priority (fastest/most-reliable first):
+      1. window._ymHitDetected — set by the JS interceptor injected via
+         Page.addScriptToEvaluateOnNewDocument in _apply_fingerprint().
+         Catches fetch/XHR/sendBeacon/Image.src the moment they're called,
+         before the request even leaves the browser. Most reliable.
+      2. performance.getEntriesByType('resource') — catches mc.yandex /watch
+         requests that completed (misses very-fast hits if called too early).
+      3. localStorage _ym*_lastHit keys — Metrika writes this after a hit.
+      4. document.images noscript pixel — fallback for old-style tracking.
+    """
     try:
         return bool(
             sb.execute_script(
                 """
+                // 1. JS-level interceptor (most reliable)
+                if (window._ymHitDetected === true) return true;
+
+                // 2. Performance resource entries
                 const resources = performance.getEntriesByType('resource') || [];
                 const hasResourceHit = resources.some((entry) => {
                     const name = entry && entry.name ? String(entry.name) : '';
                     return name.includes('mc.yandex') && name.includes('/watch');
                 });
+                if (hasResourceHit) return true;
 
-                let hasStorageHit = false;
+                // 3. localStorage marker (written by Metrika after hit)
                 try {
                     for (let i = 0; i < localStorage.length; i += 1) {
                         const key = localStorage.key(i) || '';
-                        if (/^_ym\\d+_lastHit$/.test(key)) {
-                            hasStorageHit = true;
-                            break;
-                        }
+                        if (/^_ym\\d+_lastHit$/.test(key)) return true;
                     }
                 } catch (e) {}
 
-                const hasNoscriptHit = Array.from(document.images || []).some((img) => {
+                // 4. Noscript pixel in document images
+                return Array.from(document.images || []).some((img) => {
                     const src = img && img.src ? String(img.src) : '';
                     return src.includes('mc.yandex') && src.includes('/watch');
                 });
-
-                return hasResourceHit || hasStorageHit || hasNoscriptHit;
                 """
             )
         )
@@ -543,6 +602,200 @@ def _wait_for_metrika_hit(sb: SB, timeout: int = METRIKA_HIT_TIMEOUT) -> bool:
     return hit_found
 
 
+def _has_security_verification_marker(sb: SB) -> bool:
+    """Check for the exact security verification marker element."""
+    try:
+        return bool(sb.execute_script(
+            """
+            const el = document.querySelector(arguments[0]);
+            if (!el) return false;
+            const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+            return text === arguments[1];
+            """,
+            SECURITY_VERIFICATION_SELECTOR,
+            SECURITY_VERIFICATION_TEXT,
+        ))
+    except Exception:
+        return False
+
+
+def _wait_for_security_verification(sb: SB, visit_id: int, timeout: float = 60.0) -> bool:
+    """
+    Wait for the exact security verification marker to clear before starting
+    any human-simulation activity.
+
+    Returns True  — page is clear, human simulation can start.
+    Returns False — timed out; caller should treat the visit as blocked.
+    """
+    if not _has_security_verification_marker(sb):
+        return True  # No security gate present
+
+    print(f"[{visit_id}] Security verification detected — waiting up to {timeout:.0f}s")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        if STOP_FLAG:
+            return False
+        time.sleep(2.5)
+        try:
+            if not _has_security_verification_marker(sb):
+                elapsed = time.time() - start
+                print(f"[{visit_id}] Security verification cleared in {elapsed:.1f}s")
+                time.sleep(1.5)  # Brief settle after the check clears
+                return True
+        except Exception:
+            pass
+
+    print(f"[{visit_id}] Security verification did not clear in {timeout:.0f}s — treating as blocked")
+    return False
+
+
+def _apply_fingerprint(sb, profile: dict) -> None:
+    """
+    Apply a device profile's fingerprint to the browser session via CDP.
+
+    Must be called after the browser starts but before any page loads.
+    Page.addScriptToEvaluateOnNewDocument persists the overrides across
+    every page loaded in this session (prewarm + target + any redirect).
+
+    What Yandex Metrica collects and what we fix:
+      - navigator.userAgent / platform / language / hardwareConcurrency /
+        deviceMemory / maxTouchPoints  →  overridden per profile
+      - screen.width / height / colorDepth  →  overridden per profile
+      - window.innerHeight  →  CRITICAL: real browsers subtract ~135px for
+        browser chrome; headless bots show innerHeight == screen.height (ratio 1.0)
+      - WebGL UNMASKED_VENDOR / RENDERER  →  overridden with real GPU strings
+      - Timezone  →  set via Emulation CDP domain
+    """
+    nav = profile["navigator"]
+    scr = profile["screen"]
+    vp  = profile["viewport"]
+    wgl = profile["webgl"]
+
+    # Real browsers lose ~135 px to Chrome UI on Windows, ~115 px on Mac.
+    # innerHeight = screen.height - browser_chrome_px (approx).
+    chrome_ui_px = 135 if "Win32" in profile.get("platform", "Win32") else 115
+    inner_height = max(500, scr["height"] - chrome_ui_px)
+
+    # 1. User-Agent override (also sets HTTP User-Agent header)
+    try:
+        sb.execute_cdp_cmd("Network.setUserAgentOverride", {
+            "userAgent": profile["user_agent"],
+            "platform": profile["platform"],
+        })
+    except Exception:
+        pass
+
+    # 2. Timezone override
+    try:
+        sb.execute_cdp_cmd("Emulation.setTimezoneOverride", {
+            "timezoneId": profile["timezone"],
+        })
+    except Exception:
+        pass
+
+    # 3. Build persistent fingerprint script.
+    #    Pre-serialise Python values to JSON to avoid f-string brace escaping.
+    nav_json = json.dumps({
+        "userAgent":           nav["userAgent"],
+        "appVersion":          nav["appVersion"],
+        "platform":            nav["platform"],
+        "language":            nav["language"],
+        "languages":           nav["languages"],
+        "hardwareConcurrency": nav["hardwareConcurrency"],
+        "deviceMemory":        nav["deviceMemory"],
+        "maxTouchPoints":      nav["maxTouchPoints"],
+    })
+    scr_json = json.dumps({
+        "width":       scr["width"],
+        "height":      scr["height"],
+        "availWidth":  scr["width"],
+        "availHeight": scr["height"] - 40,   # minus taskbar
+        "colorDepth":  scr["colorDepth"],
+        "pixelDepth":  scr["pixelDepth"],
+    })
+    wgl_vendor_js   = json.dumps(wgl["vendor"])
+    wgl_renderer_js = json.dumps(wgl["renderer"])
+
+    fp_script = (
+        "(function() {\n"
+        "  // navigator overrides\n"
+        "  const navProps = " + nav_json + ";\n"
+        "  for (const [k, v] of Object.entries(navProps)) {\n"
+        "    try { Object.defineProperty(navigator, k, { get: () => v, configurable: true }); } catch(e) {}\n"
+        "  }\n"
+        "  // screen overrides\n"
+        "  const scrProps = " + scr_json + ";\n"
+        "  for (const [k, v] of Object.entries(scrProps)) {\n"
+        "    try { Object.defineProperty(screen, k, { get: () => v, configurable: true }); } catch(e) {}\n"
+        "  }\n"
+        "  // window.innerHeight: subtract browser chrome so ratio != 1.0\n"
+        "  try {\n"
+        "    Object.defineProperty(window, 'innerHeight', { get: () => " + str(inner_height) + ", configurable: true });\n"
+        "    Object.defineProperty(window, 'innerWidth',  { get: () => " + str(vp["width"]) + ", configurable: true });\n"
+        "  } catch(e) {}\n"
+        "  // WebGL UNMASKED_VENDOR_WEBGL (37445) and UNMASKED_RENDERER_WEBGL (37446)\n"
+        "  const _wv = " + wgl_vendor_js + ";\n"
+        "  const _wr = " + wgl_renderer_js + ";\n"
+        "  [window.WebGLRenderingContext, window.WebGL2RenderingContext].forEach(function(Ctx) {\n"
+        "    if (!Ctx) return;\n"
+        "    const orig = Ctx.prototype.getParameter;\n"
+        "    Ctx.prototype.getParameter = function(p) {\n"
+        "      if (p === 37445) return _wv;\n"
+        "      if (p === 37446) return _wr;\n"
+        "      return orig.call(this, p);\n"
+        "    };\n"
+        "  });\n"
+        "  // ---- Yandex Metrika hit interceptor ----\n"
+        "  // Intercepts fetch/XHR/Image/sendBeacon at the JS level BEFORE the request leaves.\n"
+        "  // This is more reliable than performance.getEntriesByType() which can miss fast hits.\n"
+        "  window._ymHitDetected = false;\n"
+        "  var _capYm = function(u) {\n"
+        "    if (u && u.indexOf && u.indexOf('mc.yandex') !== -1) { window._ymHitDetected = true; }\n"
+        "  };\n"
+        "  if (window.fetch) {\n"
+        "    var _oFetch = window.fetch;\n"
+        "    window.fetch = function(u) {\n"
+        "      try { _capYm(typeof u === 'string' ? u : (u && u.url ? u.url : '')); } catch(e) {}\n"
+        "      return _oFetch.apply(this, arguments);\n"
+        "    };\n"
+        "  }\n"
+        "  if (window.XMLHttpRequest) {\n"
+        "    var _oOpen = XMLHttpRequest.prototype.open;\n"
+        "    XMLHttpRequest.prototype.open = function(m, u) {\n"
+        "      try { _capYm(String(u)); } catch(e) {}\n"
+        "      return _oOpen.apply(this, arguments);\n"
+        "    };\n"
+        "  }\n"
+        "  if (navigator.sendBeacon) {\n"
+        "    var _oBeacon = navigator.sendBeacon.bind(navigator);\n"
+        "    navigator.sendBeacon = function(u) {\n"
+        "      try { _capYm(String(u)); } catch(e) {}\n"
+        "      return _oBeacon.apply(this, arguments);\n"
+        "    };\n"
+        "  }\n"
+        "  var _ImgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');\n"
+        "  if (_ImgDesc && _ImgDesc.set) {\n"
+        "    Object.defineProperty(HTMLImageElement.prototype, 'src', {\n"
+        "      set: function(v) { try { _capYm(String(v)); } catch(e) {} return _ImgDesc.set.call(this, v); },\n"
+        "      get: _ImgDesc.get, configurable: true\n"
+        "    });\n"
+        "  }\n"
+        "})();"
+    )
+
+    try:
+        sb.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": fp_script})
+    except Exception:
+        pass
+
+    # 4. Resize the physical browser window to match the profile's screen
+    try:
+        sb.set_window_size(vp["width"], vp["height"])
+    except Exception:
+        pass
+
+
 def _visit_with_proxy_impl(
     proxy: dict,
     target: str,
@@ -568,7 +821,10 @@ def _visit_with_proxy_impl(
         parsed = urlparse(target)
         domain = parsed.netloc.replace("www.", "")
         tld = domain.split('.')[-1] if '.' in domain else 'com'
-        
+
+        # Pick a device profile for this visit (varies fingerprint across workers)
+        profile = pick_profile()
+
         # Dynamic Referer based on domain TLD
         if tld == 'uz':
             referer_url = f"https://yandex.uz/search/?text={domain}"
@@ -576,9 +832,15 @@ def _visit_with_proxy_impl(
             referer_url = f"https://yandex.ru/search/?text={domain}"
         else:
             referer_url = f"https://www.google.com/search?q={domain}"
-        
+
+        cookie_plan = get_cookie_replay_plan(target)
+
         print(f"[{visit_id}] Using proxy {proxy['host']}")
         print(f"[{visit_id}] Domain: {domain}, TLD: {tld}, Referer: {referer_url}")
+        print(f"[{visit_id}] Profile: {profile['name']}")
+        if cookie_plan["is_returning"]:
+            predicted_host = cookie_plan.get("predicted_final_host") or "unknown"
+            print(f"[{visit_id}] Returning-cookie profile selected | predicted_host={predicted_host}")
 
         with SB(
             uc=True,
@@ -608,17 +870,40 @@ def _visit_with_proxy_impl(
             except Exception:
                 pass
 
-            # Set custom headers
+            # Apply device fingerprint BEFORE any page load so the script
+            # is registered for both the prewarm URL and the target URL.
+            try:
+                _apply_fingerprint(sb, profile)
+            except Exception:
+                pass
+
+            # Build Accept-Language from profile's language list
+            _langs = profile["navigator"]["languages"]
+            _lang_header = _langs[0] + "".join(
+                f",{lang};q={round(1.0 - (i + 1) * 0.1, 1)}"
+                for i, lang in enumerate(_langs[1:5])
+            )
+
+            # Set custom headers (Referer + profile-specific Accept-Language)
             try:
                 sb.execute_cdp_cmd(
                     "Network.setExtraHTTPHeaders",
                     {
                         "headers": {
                             "Referer": referer_url,
-                            "Accept-Language": "uz-UZ,uz;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
+                            "Accept-Language": _lang_header,
                         }
                     },
                 )
+            except Exception:
+                pass
+
+            # Inject Yandex-global cookies before the Yandex prewarm so the
+            # prewarm page sees a stable Yandex-side visitor identity.
+            try:
+                injected = _inject_cookies(sb, cookie_plan["global_cookies"])
+                if injected:
+                    print(f"[{visit_id}] Injected {injected} Yandex-global cookies before prewarm")
             except Exception:
                 pass
 
@@ -634,6 +919,16 @@ def _visit_with_proxy_impl(
             if not _sleep_range(PREWARM_DELAY):
                 return _visit_result(False, False, started_at, "stopped")
 
+            # Inject first-party Metrika cookies immediately before the target
+            # open so the landing site sees them on the first request.
+            try:
+                injected = _inject_cookies(sb, cookie_plan["site_cookies"])
+                if injected:
+                    predicted_host = cookie_plan.get("predicted_final_host") or domain
+                    print(f"[{visit_id}] Injected {injected} first-party Metrika cookies for {predicted_host}")
+            except Exception:
+                pass
+
             try:
                 sb.open(target)
             except Exception as e:
@@ -646,8 +941,19 @@ def _visit_with_proxy_impl(
             if not _sleep_range(POST_OPEN_SETTLE):
                 return _visit_result(False, False, started_at, "stopped")
 
-            current_url = sb.get_current_url()
+            current_url = sb.get_current_url() or ""
             print(f"[{visit_id}] Landed on: {current_url}")
+            final_host = urlparse(current_url).netloc.replace("www.", "").split(":", 1)[0].lower()
+            predicted_host = cookie_plan.get("predicted_final_host")
+            if predicted_host and final_host and predicted_host != final_host:
+                print(f"[{visit_id}] Final host resolved to {final_host} (predicted {predicted_host})")
+
+            # Persist the observed landing host immediately so repeated short-links
+            # can pre-inject first-party cookies before the next visit.
+            try:
+                save_cookies_from_browser(target, current_url, [])
+            except Exception:
+                pass
 
             # Check if blocked
             if _page_looks_blocked(sb):
@@ -661,47 +967,54 @@ def _visit_with_proxy_impl(
                 print(f"[{visit_id}] Blocked after challenge handling")
                 return _visit_result(False, False, started_at, "blocked_after_challenge")
 
-            # Calculate scroll pattern based on content
-            scroll_pattern = _calculate_scroll_pattern(sb)
-            
-            # Perform human-like scroll
-            if not _perform_human_like_scroll(sb, scroll_pattern):
-                return _visit_result(False, False, started_at, "behavior_failed")
+            # Wait for any auto-resolving security verification page (Cloudflare WAF,
+            # centrum-air 'Performing security verification', etc.) to clear BEFORE
+            # starting human simulation. Scrolling/clicking on a security gate page
+            # is a strong bot signal since no real user does that.
+            if not _wait_for_security_verification(sb, visit_id):
+                return _visit_result(False, False, started_at, "security_verification_timeout")
 
-            # Wait for Metrika to load, then flush/verify
+            # Sample this visit's total duration from the natural distribution.
+            # ~20% will be short "bounce" visits (12-22s), the rest longer.
+            target_duration = visit_duration()
+            is_bounce = target_duration < 25
+            print(f"[{visit_id}] Target duration: {target_duration:.0f}s ({'bounce' if is_bounce else 'read'})")
+
+            # Wait for Metrika to load — passive, no synthetic JS trigger.
             metrika_ready = _metrika_loaded(sb)
             print(f"[{visit_id}] Metrika {'loaded' if metrika_ready else 'not loaded'}")
-            
+
             hit_ok = False
             if metrika_ready:
-                hit_ok = _flush_and_wait_metrika(sb, timeout=METRIKA_HIT_TIMEOUT)
-            else:
-                # Still try to wait for hit even if not initially loaded
+                # Natural hit: just wait; ym() fires automatically on page load.
                 hit_ok = _wait_for_metrika_hit(sb, timeout=METRIKA_HIT_TIMEOUT)
-            
+
             print(f"[{visit_id}] Metrika hit status: {'VERIFIED' if hit_ok else 'NOT FOUND'}")
 
-            # Simulate human reading behavior
-            if not _simulate_human_read(sb, 8, 12):  # Reduced for faster execution
-                return _visit_result(False, hit_ok, started_at, "human_sim_failed")
+            # Bounce visits exit immediately after Metrika fires (or times out).
+            if is_bounce:
+                elapsed = time.time() - started_at
+                remaining = max(0.0, target_duration - elapsed)
+                if remaining > 0:
+                    _sleep_interruptible(remaining)
+                # No scrolling for bounce visits — they just leave
+            else:
+                # Calculate scroll pattern based on content
+                scroll_pattern = _calculate_scroll_pattern(sb)
 
-            # Optional secondary tabs for variety
-            if secondary_urls:
-                for extra in secondary_urls:
-                    if STOP_FLAG:
-                        return _visit_result(False, hit_ok, started_at, "stopped")
-                    try:
-                        sb.open_new_tab(extra)
-                        _sleep_range((0.8, 1.2))
-                        sb.switch_to_window(0)
-                    except Exception:
-                        try:
-                            sb.close_current_window()
-                            sb.switch_to_window(0)
-                        except Exception:
-                            pass
+                # Perform human-like scroll
+                if not _perform_human_like_scroll(sb, scroll_pattern):
+                    return _visit_result(False, hit_ok, started_at, "behavior_failed")
 
-            # Final Metrika check (may have loaded during human simulation)
+                # Fill remaining time up to target_duration with human reading
+                elapsed = time.time() - started_at
+                read_time = max(5.0, target_duration - elapsed)
+                read_min = max(5, int(read_time * 0.7))
+                read_max = max(read_min + 1, int(read_time * 1.1))
+                if not _simulate_human_read(sb, read_min, read_max):
+                    return _visit_result(False, hit_ok, started_at, "human_sim_failed")
+
+            # Final Metrika check if not yet verified
             if not hit_ok:
                 hit_ok = _wait_for_metrika_hit(sb, timeout=METRIKA_HIT_TIMEOUT)
                 print(f"[{visit_id}] Final Metrika check: {'VERIFIED' if hit_ok else 'NOT FOUND'}")
@@ -717,6 +1030,15 @@ def _visit_with_proxy_impl(
                 f"[{visit_id}] Visit completed | hit={hit_ok} "
                 f"| duration={final_elapsed:.1f}s | final_url={current_url}"
             )
+
+            # Persist cookies using the final landing host for `_ym_*` cookies and
+            # a shared pool for Yandex-global cookies.
+            try:
+                raw_cookies = sb.execute_cdp_cmd("Network.getAllCookies", {}).get("cookies", [])
+                save_cookies_from_browser(target, current_url, raw_cookies)
+            except Exception:
+                pass
+
             return _visit_result(True, hit_ok, started_at)
 
     except Exception as e:

@@ -94,25 +94,22 @@ async def worker_loop_v2(
     logger = get_logger()
     logger.worker_start(worker_id, total_workers)
 
-    consecutive_none_count = 0
-    max_none_before_exit = 2  # Exit only after 2 consecutive None returns
-
     while True:
         if dispatcher.is_stopped:
             break
 
         task = await dispatcher.next_task()
         if task is None:
-            consecutive_none_count += 1
-            if consecutive_none_count >= max_none_before_exit:
-                # Exit only after confirming no more tasks are available
+            # None means either: queue empty OR domain on cooldown.
+            # Only exit if the queue is truly exhausted AND we've met
+            # our completion count. Otherwise keep waiting.
+            if dispatcher.remaining == 0 and dispatcher.completed >= dispatcher.total:
                 break
-            else:
-                # Brief pause before checking again
-                await asyncio.sleep(0.05)
-                continue
-        
-        consecutive_none_count = 0  # Reset counter when we get a task
+            # Queue has items on cooldown — sleep briefly and retry.
+            await asyncio.sleep(1.0)
+            continue
+
+        domain = urlparse(task["url"]).netloc.replace("www.", "")
 
         success = False
         final_result = {
@@ -121,31 +118,36 @@ async def worker_loop_v2(
             "error": "not_started",
         }
 
-        for attempt in range(MAX_RETRIES + 1):
-            logger.visit_start(worker_id, task["url"], attempt + 1, MAX_RETRIES + 1)
+        try:
+            for attempt in range(MAX_RETRIES + 1):
+                logger.visit_start(worker_id, task["url"], attempt + 1, MAX_RETRIES + 1)
 
-            if attempt > 0:
-                delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** (attempt - 1))
-                jitter = delay * random.uniform(0.05, 0.25)
-                final_delay = delay + jitter
-                logger.retry(worker_id, final_delay, attempt, MAX_RETRIES)
-                await asyncio.sleep(final_delay)
+                if attempt > 0:
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** (attempt - 1))
+                    jitter = delay * random.uniform(0.05, 0.25)
+                    final_delay = delay + jitter
+                    logger.retry(worker_id, final_delay, attempt, MAX_RETRIES)
+                    await asyncio.sleep(final_delay)
 
-            final_result = await _run_attempt_v2(
-                asyncio.get_running_loop(),
-                executor,
-                task["url"],
-                worker_id,
-            )
+                final_result = await _run_attempt_v2(
+                    asyncio.get_running_loop(),
+                    executor,
+                    task["url"],
+                    worker_id,
+                )
 
-            success = bool(final_result.get("success"))
-            if success:
-                break
+                success = bool(final_result.get("success"))
+                if success:
+                    break
+
+        finally:
+            # Always release the concurrency slot so the next worker can pick up
+            # a task for this domain. This runs even if the visit throws an exception.
+            dispatcher.release_domain(domain)
 
         duration = float(final_result.get("duration", 0.0))
         hit_verified = bool(final_result.get("hit_verified"))
         error = final_result.get("error")
-        domain = urlparse(task["url"]).netloc.replace("www.", "")
 
         if success:
             try:

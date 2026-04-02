@@ -108,12 +108,12 @@ def progress_bar(current: int, total: int) -> str:
         return "────── 0%"
     
     pct = min(100, round(current / total * 100))
-    filled = pct // 10
+    filled = 0 if pct == 0 else min(10, (pct + 5) // 10)
     empty = 10 - filled
     
     # Different progress bar styles based on percentage
     if pct < 20:
-        bar = "○" * filled + "●" * empty
+        bar = "●" * filled + "○" * empty
     elif pct < 50:
         bar = "●" * filled + "○" * empty
     elif pct < 80:
@@ -593,7 +593,7 @@ async def stop_from_keyboard(message: types.Message):
         await reset_active_to_pending()
         await message.answer("🛑 <b>To'xtatildi.</b> Workerlar tugatilmoqda...", parse_mode="HTML")
     else:
-        await message.answer("Hech narsa ishlamayapti.")
+        await message.answer("Hech narsa ishlamayapti. (Sessionlar yopilayotgan bo'lishi mumkin, biroz kuting!)")
 
 
 # ---- Stop (inline button on progress message) ----
