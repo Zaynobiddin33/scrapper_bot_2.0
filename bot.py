@@ -30,6 +30,7 @@ from db import (
     clear_all_tasks, mark_all_active, reset_active_to_pending,
 )
 from dispatcher import Dispatcher as TaskDispatcher
+from pacing import DeadlinePacer
 from runner_v2 import run_workers_v2 as run_workers
 
 # Try importing SERVICE_NAME (optional, not all setups have it)
@@ -447,36 +448,16 @@ async def start_run_execute(message: types.Message, state: FSMContext):
     # Shared list — workers append actual visit durations here
     visit_durations: list[float] = []
 
-    # Dynamic delay calculator — accounts for visit execution time
+    pacer = DeadlinePacer(
+        deadline_ts=deadline.timestamp() if deadline else None,
+        total_tasks=total,
+        dispatcher=_active_dispatcher,
+        visit_durations=visit_durations,
+        default_delay=8.0,
+    )
+
     def calc_delay() -> float:
-        if deadline is None:
-            return 8.0  # default 8s per task per worker
-
-        remaining_secs = (deadline - datetime.now(TASHKENT_TZ)).total_seconds()
-
-        # If deadline passed, rush remaining tasks with minimal delay
-        if remaining_secs <= 0:
-            return 1.0
-
-        remaining_tasks = max(1, _active_dispatcher.remaining)
-
-        # Total cycle time budget per task (visit + delay combined)
-        # Formula: time_left / (tasks_left / num_workers)
-        #        = time_left * num_workers / tasks_left
-        cycle_budget = remaining_secs / remaining_tasks * num_workers
-
-        # Use rolling average of last 30 visits, or 30s estimate initially
-        recent = visit_durations[-30:] if visit_durations else []
-        avg_visit = sum(recent) / len(recent) if recent else 30.0
-
-        # Delay = cycle budget minus the time the visit itself takes
-        delay = cycle_budget - avg_visit
-
-        # Trim visit_durations to prevent unbounded growth (1200+ visits)
-        if len(visit_durations) > 60:
-            del visit_durations[:-60]
-
-        return max(1.0, min(delay, 600.0))
+        return pacer.get_delay()
 
     deadline_str = deadline.strftime("%H:%M") if deadline else "auto"
     eta = ""
@@ -532,6 +513,7 @@ async def start_run_execute(message: types.Message, state: FSMContext):
                 get_delay=calc_delay,
                 on_progress=do_progress_update,
                 visit_durations=visit_durations,
+                pace_first_task=pacer.enabled,
             )
             await reset_active_to_pending()
             was_stopped = _active_dispatcher.is_stopped if _active_dispatcher else False

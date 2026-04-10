@@ -180,6 +180,11 @@ class Dispatcher:
     def total(self) -> int:
         return self._total
 
+    @property
+    def in_flight_total(self) -> int:
+        """Total visits currently running across all domains."""
+        return sum(self._domain_in_flight.values())
+
     def mark_completed(self):
         """Record one finished click-job."""
         self._completed += 1

@@ -89,14 +89,22 @@ async def worker_loop_v2(
     visit_durations: list[float],
     get_delay,
     executor: ProcessPoolExecutor,
+    pace_first_task: bool = False,
 ):
     """Async worker loop that submits blocking visits to child processes."""
     logger = get_logger()
     logger.worker_start(worker_id, total_workers)
+    should_wait_before_next_task = pace_first_task
 
     while True:
         if dispatcher.is_stopped:
             break
+
+        if should_wait_before_next_task:
+            delay = get_delay()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        should_wait_before_next_task = False
 
         task = await dispatcher.next_task()
         if task is None:
@@ -182,9 +190,7 @@ async def worker_loop_v2(
         if dispatcher.is_stopped:
             break
 
-        delay = get_delay()
-        jitter = random.uniform(-delay * 0.2, delay * 0.2) if delay > 0 else 0.0
-        await asyncio.sleep(max(0.5, delay + jitter))
+        should_wait_before_next_task = True
 
     logger.worker_stop(worker_id)
 
@@ -195,6 +201,7 @@ async def run_workers_v2(
     get_delay=lambda: 8.0,
     on_progress=None,
     visit_durations=None,
+    pace_first_task: bool = False,
 ):
     """Run scrp_v2 visits with process-level parallelism."""
     if visit_durations is None:
@@ -240,6 +247,7 @@ async def run_workers_v2(
                     visit_durations,
                     get_delay,
                     executor,
+                    pace_first_task=pace_first_task,
                 )
             )
             for i in range(safe_workers)
