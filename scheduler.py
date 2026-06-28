@@ -16,8 +16,8 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 TASHKENT_TZ = timezone(timedelta(hours=5))
-TRIGGER_HOUR = 22
-TRIGGER_MINUTE = 30
+TRIGGER_HOUR = 23
+TRIGGER_MINUTE = 00
 
 # Shared auto-run state (read by bot.py for the 📡 Auto status display)
 auto_run_info: dict = {
@@ -72,7 +72,7 @@ async def run_scheduler_loop(
 
 async def _do_reklama_run(bot, admin_ids, api_id, api_hash, session_string, channels):
     global auto_run_info, auto_dispatcher
-    from telethon_scraper import fetch_reklama_tasks
+    from telethon_scraper import fetch_reklama_tasks, build_telethon_proxy
     from db import add_tasks_bulk, mark_all_active, reset_active_to_pending
     from dispatcher import Dispatcher
     from runner_v2 import run_workers_v2
@@ -103,7 +103,11 @@ async def _do_reklama_run(bot, admin_ids, api_id, api_hash, session_string, chan
     # Use connect()+is_user_authorized() rather than start(): this runs
     # unattended at 19:00, and start() would block on input() for a phone/code
     # if the session were ever invalid. Fail cleanly instead.
-    client = TelegramClient(StringSession(session_string), api_id, api_hash)
+    # proxy: some hosts block Telegram's MTProto IPs — route through the proxy.
+    client = TelegramClient(
+        StringSession(session_string), api_id, api_hash,
+        proxy=build_telethon_proxy(),
+    )
     try:
         await client.connect()
         if not await client.is_user_authorized():

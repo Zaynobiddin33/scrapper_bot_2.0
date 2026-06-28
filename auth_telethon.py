@@ -31,7 +31,17 @@ async def main():
         print("❌ Fill in API_ID, API_HASH, and PHONE at the top of this file first.")
         return
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    # Route through the proxy if configured — needed on hosts that block
+    # Telegram's MTProto data-center IPs (direct connect times out there).
+    try:
+        from telethon_scraper import build_telethon_proxy
+        proxy = build_telethon_proxy()
+    except Exception:
+        proxy = None
+    if proxy:
+        print("🌐 Using proxy for Telethon connection.")
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy)
     await client.connect()
 
     if not await client.is_user_authorized():

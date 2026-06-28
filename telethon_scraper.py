@@ -20,6 +20,37 @@ _URL_RE = re.compile(r'https?://[^\s<>"\'\]\)\,]+')
 _REKLAMA_RE = re.compile(r'#reklama(?!\w)', re.IGNORECASE)
 
 
+def build_telethon_proxy():
+    """
+    Build a Telethon proxy dict from tokens PROXY_* settings.
+
+    Why: some hosts block Telegram's MTProto data-center IP ranges
+    (149.154.x.x), so the user-client (Telethon) cannot connect directly even
+    though the Bot API over api.telegram.org still works. Routing Telethon
+    through the existing HTTP proxy bypasses that block.
+
+    Returns None when no proxy is configured or python-socks is unavailable,
+    in which case Telethon connects directly.
+    """
+    try:
+        import tokens
+        from python_socks import ProxyType
+    except Exception:
+        return None
+
+    host = getattr(tokens, "PROXY_HOST", None)
+    port = getattr(tokens, "PROXY_PORT", None)
+    if not host or not port:
+        return None
+
+    proxy = dict(proxy_type=ProxyType.HTTP, addr=host, port=int(port), rdns=True)
+    user = getattr(tokens, "USERNAME", None)
+    if user:
+        proxy["username"] = user
+        proxy["password"] = getattr(tokens, "PASSWORD", None)
+    return proxy
+
+
 async def _resolve_channels(client: TelegramClient, channels: list) -> list:
     """
     Decide which channels to scan.
