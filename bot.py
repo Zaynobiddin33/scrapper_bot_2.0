@@ -32,12 +32,26 @@ from db import (
 from dispatcher import Dispatcher as TaskDispatcher
 from pacing import DeadlinePacer
 from runner_v2 import run_workers_v2 as run_workers
+import scheduler as _scheduler
 
 # Try importing SERVICE_NAME (optional, not all setups have it)
 try:
     from tokens import SERVICE_NAME
 except ImportError:
     SERVICE_NAME = None
+
+# Telethon / auto-scheduler config (optional — scheduler won't start if missing)
+try:
+    from tokens import (
+        TELETHON_API_ID, TELETHON_API_HASH,
+        TELETHON_SESSION_STRING, REKLAMA_CHANNELS,
+    )
+    # REKLAMA_CHANNELS is optional: empty = scan ALL channels the account joined.
+    _TELETHON_READY = bool(TELETHON_API_ID and TELETHON_API_HASH and TELETHON_SESSION_STRING)
+except ImportError:
+    TELETHON_API_ID = TELETHON_API_HASH = TELETHON_SESSION_STRING = None
+    REKLAMA_CHANNELS = []
+    _TELETHON_READY = False
 
 
 # ==================== AUTH MIDDLEWARE ====================
@@ -86,6 +100,7 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="📝 Vazifalar qo'shish")],
         [KeyboardButton(text="▶️ Boshlash"), KeyboardButton(text="📊 Dashboard")],
         [KeyboardButton(text="🗑️ Tozalash"), KeyboardButton(text="🛑 To'xtatish")],
+        [KeyboardButton(text="📡 Auto (#reklama)")],
     ],
     resize_keyboard=True,
 )
@@ -370,10 +385,14 @@ async def add_urls_receive(message: types.Message, state: FSMContext):
 @router.message(lambda m: m.text and m.text.startswith("▶️"))
 async def start_run_prompt(message: types.Message, state: FSMContext):
     global _active_run_task
-    if _active_run_task and not _active_run_task.done():
+    manual_running = _active_run_task is not None and not _active_run_task.done()
+    if manual_running or _scheduler.any_run_active():
+        is_auto = _scheduler.auto_run_info.get("status") == "running" and not manual_running
+        which = "📡 Avtomatik #reklama session" if is_auto else "▶️ Qo'lda boshlangan session"
         await message.answer(
-            "⚠️ Jarayon allaqachon ishlayapti!\n"
-            "Avval <b>🛑 To'xtatish</b> tugmasini bosing.",
+            f"⚠️ <b>{which} hozir ishlayapti!</b>\n"
+            "Yangi session boshlash uchun avval shu session tugashi kerak "
+            "(yoki <b>🛑 To'xtatish</b> tugmasini bosing).",
             parse_mode="HTML",
         )
         return
@@ -432,18 +451,44 @@ async def start_run_execute(message: types.Message, state: FSMContext):
             )
             return
 
+    # Only now (input validated) claim the run slot. The guard check and the
+    # claim happen with no await between them, so the 19:00 auto-run cannot
+    # interleave; once claimed, the auto-run defers to us. Auto-run may have
+    # fired while the admin was typing the deadline — reject in that case.
+    manual_running = _active_run_task is not None and not _active_run_task.done()
+    if manual_running or _scheduler.any_run_active():
+        await state.clear()
+        await message.answer(
+            "⚠️ Boshqa session hozir ishlayapti — yangi session boshlab bo'lmaydi.",
+            parse_mode="HTML",
+            reply_markup=main_kb,
+        )
+        return
+    _scheduler.manual_run_active = True
+
     await state.clear()
     run_started_ts = datetime.now().timestamp()
 
-    # Build the shuffled task queue
-    _active_dispatcher = TaskDispatcher()
-    total = await _active_dispatcher.build_queue()
+    # Build the shuffled task queue. If anything here fails, release the run
+    # slot so a DB hiccup doesn't permanently block manual and auto runs.
+    try:
+        _active_dispatcher = TaskDispatcher()
+        total = await _active_dispatcher.build_queue()
 
-    if total == 0:
-        await message.answer("📭 Bajarilishi kerak bo'lgan click yo'q.")
+        if total == 0:
+            _scheduler.manual_run_active = False
+            await message.answer("📭 Bajarilishi kerak bo'lgan click yo'q.")
+            return
+
+        await mark_all_active()
+    except Exception as e:
+        _scheduler.manual_run_active = False
+        _active_dispatcher = None
+        await message.answer(
+            f"❌ Boshlashda xato: <code>{html.escape(str(e)[:200])}</code>",
+            parse_mode="HTML",
+        )
         return
-
-    await mark_all_active()
 
     # Shared list — workers append actual visit durations here
     visit_durations: list[float] = []
@@ -562,7 +607,9 @@ async def start_run_execute(message: types.Message, state: FSMContext):
         finally:
             _active_dispatcher = None
             _active_run_task = None
+            _scheduler.manual_run_active = False
 
+    # (manual_run_active was already set True after the start guard above)
     _active_run_task = asyncio.create_task(run())
 
 
@@ -570,8 +617,16 @@ async def start_run_execute(message: types.Message, state: FSMContext):
 @router.message(lambda m: m.text and m.text.startswith("🛑"))
 async def stop_from_keyboard(message: types.Message):
     global _active_dispatcher
+    stopped = False
     if _active_dispatcher and not _active_dispatcher.is_stopped:
         _active_dispatcher.stop()
+        stopped = True
+    # Also stop the auto (#reklama) run if one is in progress
+    auto = _scheduler.auto_dispatcher
+    if auto and not auto.is_stopped:
+        auto.stop()
+        stopped = True
+    if stopped:
         await reset_active_to_pending()
         await message.answer("🛑 <b>To'xtatildi.</b> Workerlar tugatilmoqda...", parse_mode="HTML")
     else:
@@ -640,10 +695,91 @@ async def clear_no(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# ---- Auto (#reklama) status ----
+@router.message(lambda m: m.text and m.text.startswith("📡"))
+async def auto_status_handler(message: types.Message):
+    info = _scheduler.auto_run_info
+    status = info.get("status", "idle")
+
+    if not _TELETHON_READY:
+        await message.answer(
+            "⚠️ <b>Telethon sozlanmagan</b>\n\n"
+            "tokens.py ichiga quyidagilarni kiriting:\n"
+            "• <code>TELETHON_API_ID</code>\n"
+            "• <code>TELETHON_API_HASH</code>\n"
+            "• <code>TELETHON_SESSION_STRING</code> (auth_telethon.py orqali)\n"
+            "• <code>REKLAMA_CHANNELS</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    now = datetime.now(TASHKENT_TZ)
+    from scheduler import _secs_until_trigger
+    secs = _secs_until_trigger()
+    next_h, next_m = int(secs // 3600), int((secs % 3600) // 60)
+
+    status_labels = {
+        "idle": "😴 Kutilmoqda",
+        "running": "🔄 Ishlayapti",
+        "done": "✅ Tugadi",
+        "failed": "❌ Xato",
+    }
+    status_str = status_labels.get(status, status)
+
+    lines = [
+        f"📡 <b>Auto #reklama</b>\n",
+        f"Status: {status_str}",
+        f"Keyingi run: <b>{next_h}h {next_m}m</b> (19:00 Tashkent)\n",
+    ]
+
+    if info.get("run_date"):
+        lines.append(f"Oxirgi run: <b>{info['run_date']}</b>")
+        total_target = info.get("total_target", 0)
+        total_done = info.get("total_done", 0)
+        tasks = info.get("tasks", [])
+        if total_target:
+            bar = progress_bar(total_done, total_target)
+            lines.append(f"Natija: {total_done}/{total_target} {bar}")
+        if tasks:
+            lines.append(f"\nTopilgan postlar ({len(tasks)} ta):")
+            for t in tasks[:10]:
+                ch = t.get("channel", "").lstrip("@")
+                lines.append(
+                    f"  • @{ch} — {t.get('views', 0):,} views → "
+                    f"<b>{t.get('target_clicks', 0)}</b> visit"
+                )
+            if len(tasks) > 10:
+                lines.append(f"  ... va yana {len(tasks) - 10} ta")
+        if info.get("error"):
+            lines.append(f"\n❌ Xato: <code>{html.escape(str(info['error'])[:200])}</code>")
+
+    if REKLAMA_CHANNELS:
+        channels_list = ", ".join(str(c) for c in REKLAMA_CHANNELS)
+    else:
+        channels_list = "Hammasi (account a'zo bo'lgan barcha kanallar)"
+    lines.append(f"\nKanallar: <code>{html.escape(channels_list)}</code>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_kb)
+
+
 # ==================== STARTUP / MAIN ====================
 async def on_startup():
     await init_db()
     print("Bot started. Database initialized.")
+    if _TELETHON_READY:
+        asyncio.create_task(
+            _scheduler.run_scheduler_loop(
+                bot=bot,
+                admin_ids=AUTHORIZED_USER_IDS,
+                api_id=TELETHON_API_ID,
+                api_hash=TELETHON_API_HASH,
+                session_string=TELETHON_SESSION_STRING,
+                channels=REKLAMA_CHANNELS,
+            )
+        )
+        print(f"[scheduler] Auto #reklama enabled. Channels: {REKLAMA_CHANNELS}")
+    else:
+        print("[scheduler] Telethon not configured — auto #reklama disabled.")
 
 
 async def main():
