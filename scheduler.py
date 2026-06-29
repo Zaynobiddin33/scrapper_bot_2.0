@@ -16,7 +16,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 TASHKENT_TZ = timezone(timedelta(hours=5))
-TRIGGER_HOUR = 23
+TRIGGER_HOUR = 19
 TRIGGER_MINUTE = 00
 
 # Shared auto-run state (read by bot.py for the 📡 Auto status display)
