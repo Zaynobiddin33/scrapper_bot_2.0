@@ -3,9 +3,11 @@ Shuffled Task Dispatcher.
 Flattens all pending DB tasks into individual click-jobs,
 applies Fisher-Yates shuffle, and serves them to workers via async queue.
 
-Per-domain rate limiting: enforces a minimum gap between visits to the
-same domain so Yandex Metrika fraud detection is not triggered by a burst
-of visits to a single counter in a short window.
+Per-LINK rate limiting: enforces a minimum gap + concurrency cap per unique
+URL (not per domain). The ad links are all Yandex shortlinks (ya.cc/t/<id>)
+that resolve to the same domain (yandex.ru), so keying on domain would force
+every ad through one lane. Keying on the unique link lets different ads run in
+parallel while still pacing repeated visits to the SAME ad/counter.
 """
 import random
 import time
@@ -13,25 +15,15 @@ import asyncio
 from urllib.parse import urlparse
 from db import get_pending_tasks
 
-# Concurrency-slot model (replaces the old 120s time-gate).
-#
-# OLD approach (broke parallelism): one task dispatched per domain per 120 seconds.
-# With centrum-air.com being the only domain, only 1 browser ran at a time.
-#
-# NEW approach:
-#   MAX_CONCURRENT_PER_DOMAIN — up to N browsers may work the same domain simultaneously.
-#   DOMAIN_DISPATCH_MIN_GAP  — minimum stagger between STARTING visits to the same domain,
-#                               so the 3 parallel starts are spread 15s apart rather than
-#                               all hitting the counter at the exact same millisecond.
-#
-# Effect: with 5 workers and centrum-air.com:
-#   T=0s  → Worker 1 dispatched
-#   T=15s → Worker 2 dispatched  (15s stagger)
-#   T=30s → Worker 3 dispatched  (at MAX_CONCURRENT=3, workers 4 & 5 wait)
-#   T~90s → Worker 1 finishes, slot released → Worker 4 dispatched
-#   T~105s → Worker 5 dispatched
+# Concurrency-slot model, keyed per unique link:
+#   MAX_CONCURRENT_PER_DOMAIN — up to N visits to the SAME link may run at once.
+#   DOMAIN_DISPATCH_MIN_GAP  — minimum stagger between STARTING visits to the
+#                              same link, so repeated hits to one ad/counter are
+#                              spread out rather than all firing at once.
+# Different links are independent → many ads run concurrently (bounded only by
+# the worker count), which is what clears a large queue within the day.
 MAX_CONCURRENT_PER_DOMAIN = 3
-DOMAIN_DISPATCH_MIN_GAP   = 15    # seconds between dispatching to same domain
+DOMAIN_DISPATCH_MIN_GAP   = 15    # seconds between dispatching to the same link
 
 
 class Dispatcher:
@@ -40,9 +32,9 @@ class Dispatcher:
         self._stop = False
         self._total = 0
         self._completed = 0
-        # domain → monotonic timestamp of last dispatch (for stagger gap)
+        # link-key → monotonic timestamp of last dispatch (for stagger gap)
         self._domain_last_dispatched: dict[str, float] = {}
-        # domain → count of visits currently in-flight (for concurrency cap)
+        # link-key → count of visits currently in-flight (for concurrency cap)
         self._domain_in_flight: dict[str, int] = {}
 
     async def build_queue(self) -> int:
@@ -74,8 +66,16 @@ class Dispatcher:
         self._domain_in_flight.clear()
         return self._total
 
+    def rl_key(self, url: str) -> str:
+        """
+        Rate-limit key = the unique link (fragment stripped). Each distinct ad
+        link is its own lane; identical URLs (repeat visits to one ad) share a
+        lane. Used by both dispatch and the runner's release call so they match.
+        """
+        return (url or "").split("#")[0].strip()
+
     def _extract_domain(self, url: str) -> str:
-        """Normalize URL to bare domain for rate-limit keying."""
+        """Bare domain — kept for logging/back-compat (not used for keying)."""
         try:
             return urlparse(url).netloc.replace("www.", "").lower()
         except Exception:
@@ -86,13 +86,9 @@ class Dispatcher:
         Get the next click-job that satisfies the concurrency-slot model,
         or None if all slots are full / queue empty / stopped.
 
-        A task is dispatchable when BOTH conditions hold:
-          1. in_flight[domain] < MAX_CONCURRENT_PER_DOMAIN  (concurrency cap)
-          2. now - last_dispatched[domain] >= DOMAIN_DISPATCH_MIN_GAP  (stagger gap)
-
-        The stagger gap prevents all workers from hammering the same counter at the
-        exact same second on start-up. Once a visit finishes and releases its slot,
-        the next visit for that domain is eligible immediately (gap already elapsed).
+        A task is dispatchable when BOTH conditions hold for its link-key:
+          1. in_flight[key] < MAX_CONCURRENT_PER_DOMAIN  (concurrency cap)
+          2. now - last_dispatched[key] >= DOMAIN_DISPATCH_MIN_GAP  (stagger gap)
         """
         if self._stop:
             return None
@@ -117,9 +113,9 @@ class Dispatcher:
         chosen_idx: int | None = None
 
         for idx, item in enumerate(pending):
-            domain = self._extract_domain(item["url"])
-            in_flight = self._domain_in_flight.get(domain, 0)
-            last_dispatched = self._domain_last_dispatched.get(domain, 0.0)
+            key = self.rl_key(item["url"])
+            in_flight = self._domain_in_flight.get(key, 0)
+            last_dispatched = self._domain_last_dispatched.get(key, 0.0)
 
             slot_free  = in_flight < MAX_CONCURRENT_PER_DOMAIN
             gap_ok     = (now - last_dispatched) >= DOMAIN_DISPATCH_MIN_GAP
@@ -143,19 +139,19 @@ class Dispatcher:
                 await self._queue.put(item)
 
         # Claim the concurrency slot and record dispatch time
-        domain = self._extract_domain(chosen["url"])
-        self._domain_in_flight[domain] = self._domain_in_flight.get(domain, 0) + 1
-        self._domain_last_dispatched[domain] = time.monotonic()
+        key = self.rl_key(chosen["url"])
+        self._domain_in_flight[key] = self._domain_in_flight.get(key, 0) + 1
+        self._domain_last_dispatched[key] = time.monotonic()
         return chosen
 
-    def release_domain(self, domain: str) -> None:
+    def release_domain(self, key: str) -> None:
         """
-        Release one concurrency slot for domain.
-        Called by the runner after a visit (success or failure) completes.
-        This is what allows the next worker to pick up a task for that domain.
+        Release one concurrency slot for a link-key.
+        Called by the runner after a visit (success or failure) completes,
+        using dispatcher.rl_key(url) so it matches the dispatch claim.
         """
-        self._domain_in_flight[domain] = max(
-            0, self._domain_in_flight.get(domain, 0) - 1
+        self._domain_in_flight[key] = max(
+            0, self._domain_in_flight.get(key, 0) - 1
         )
 
     def stop(self):
@@ -182,7 +178,7 @@ class Dispatcher:
 
     @property
     def in_flight_total(self) -> int:
-        """Total visits currently running across all domains."""
+        """Total visits currently running across all links."""
         return sum(self._domain_in_flight.values())
 
     def mark_completed(self):

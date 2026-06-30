@@ -431,7 +431,7 @@ async def start_run_execute(message: types.Message, state: FSMContext):
         return
 
     deadline = None
-    num_workers = 5
+    num_workers = 8
 
     if text != "auto":
         try:
@@ -729,7 +729,7 @@ async def auto_status_handler(message: types.Message):
     lines = [
         f"📡 <b>Auto #reklama</b>\n",
         f"Status: {status_str}",
-        f"Keyingi run: <b>{next_h}h {next_m}m</b> (19:00 Tashkent)\n",
+        f"Keyingi tekshiruv: <b>{next_h}h {next_m}m</b> (har 2 soatda, 08:00-24:00)\n",
     ]
 
     if info.get("run_date"):

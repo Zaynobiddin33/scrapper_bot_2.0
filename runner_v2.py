@@ -151,7 +151,7 @@ async def worker_loop_v2(
         finally:
             # Always release the concurrency slot so the next worker can pick up
             # a task for this domain. This runs even if the visit throws an exception.
-            dispatcher.release_domain(domain)
+            dispatcher.release_domain(dispatcher.rl_key(task["url"]))
 
         duration = float(final_result.get("duration", 0.0))
         hit_verified = bool(final_result.get("hit_verified"))
