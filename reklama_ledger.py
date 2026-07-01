@@ -5,7 +5,7 @@ Tracks, per (run_date, channel, msg_id), how many of a post's views have
 already been converted into visits ('accounted_views'), so each 2-hour cycle
 acts only on the NEW views since the last check.
 
-Rule: 2 visits per full 100 new views; the remainder (<100) carries to the
+Rule: 1 visit per full 100 new views; the remainder (<100) carries to the
 next cycle. Stored in the same SQLite file as the task queue (tasks.db).
 """
 import os

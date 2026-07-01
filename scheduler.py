@@ -5,11 +5,11 @@ Each cycle:
   1. Connect Telethon (through the proxy) and scan ALL subscribed channels for
      today's #reklama posts.
   2. For each post, look at how many NEW views accumulated since the last check
-     (ledger). Convert every full 100 new views into 2 visits; carry the
+     (ledger). Convert every full 100 new views into 1 visit; carry the
      remainder (<100) to the next cycle.
         new = current_views - accounted_views
         blocks  = new // 100
-        visits  = blocks * 2
+        visits  = blocks * 1
         accounted_views += blocks * 100   (remainder waits)
   3. Enqueue those visits and run the workers to drain them (small batch).
   4. Notify admins with a per-cycle summary.
@@ -32,7 +32,7 @@ CYCLE_TIMES = [(8, 0), (10, 0), (12, 0), (14, 0), (16, 0),
                (18, 0), (20, 0), (22, 0), (23, 59)]
 
 VIEWS_PER_BLOCK = 100      # every full 100 new views ...
-VISITS_PER_BLOCK = 2       # ... yields 2 visits (= 2%)
+VISITS_PER_BLOCK = 1       # ... yields 1 visit (= 1%)
 NUM_WORKERS = 8
 
 # Shared auto-run state (read by bot.py for the 📡 Auto status display)
@@ -66,13 +66,13 @@ def compute_cycle_visits(current_views: int, accounted_views: int) -> tuple[int,
     Given a post's current total views and how many views were already
     converted to visits (accounted_views), return (visits_to_add, new_accounted).
 
-    2 visits per full 100 NEW views; the remainder (<100) stays unaccounted and
+    1 visit per full 100 NEW views; the remainder (<100) stays unaccounted and
     carries to the next cycle. Examples:
-      (200,   0) -> (4, 200)      first check, 200 views
-      (400, 200) -> (4, 400)      +200 new
-      (230,   0) -> (4, 200)      4 visits = 2% of 200; 30 carried
+      (200,   0) -> (2, 200)      first check, 200 views
+      (400, 200) -> (2, 400)      +200 new
+      (230,   0) -> (2, 200)      2 visits = 1% of 200; 30 carried
       ( 80,   0) -> (0,   0)      <100 new -> wait
-      (280, 200) -> (0, 200) ... wait, 80 new -> wait
+      (280, 200) -> (0, 200)      80 new -> wait
     """
     new = max(0, current_views - accounted_views)
     blocks = new // VIEWS_PER_BLOCK

@@ -1,7 +1,7 @@
 """
 Telethon scraper: fetches today's #reklama posts from configured channels.
 Returns tasks: {url, target_clicks, views, channel, post_id}.
-target_clicks = int(views * 0.02), minimum 1.
+target_clicks = int(views * 0.01), minimum 1.
 """
 import re
 from datetime import datetime, timedelta, timezone
@@ -114,7 +114,7 @@ async def fetch_reklama_tasks(client: TelegramClient, channels: list) -> list[di
                 # One post → one visit task: take only the first URL found.
                 url = urls[0]
                 views = getattr(msg, "views", 0) or 0
-                target = max(1, int(views * 0.02))
+                target = max(1, int(views * 0.01))
                 results.append({
                     "url": url,
                     "target_clicks": target,
