@@ -431,7 +431,7 @@ async def start_run_execute(message: types.Message, state: FSMContext):
         return
 
     deadline = None
-    num_workers = 8
+    num_workers = 5
 
     if text != "auto":
         try:
