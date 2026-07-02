@@ -18,6 +18,7 @@ from tokens import PASSWORD, PROXY_HOST, PROXY_PORT, USERNAME
 
 from cookie_store import get_cookie_replay_plan, save_cookies_from_browser
 from device_profiles import pick_profile
+from metrika_hit import HitCapture, host_has_no_metrika
 
 # Global stop flag - use with caution in async context
 STOP_FLAG = False
@@ -916,6 +917,14 @@ def _visit_with_proxy_impl(
             except Exception:
                 pass
 
+            # Begin capturing Metrika /watch beacons at the CDP network layer
+            # (reliable across UC/CDP mode; see metrika_hit.py).
+            hit_cap = HitCapture(sb)
+            try:
+                hit_cap.start()
+            except Exception:
+                pass
+
             if not _sleep_range(PREWARM_DELAY):
                 return _visit_result(False, False, started_at, "stopped")
 
@@ -930,6 +939,7 @@ def _visit_with_proxy_impl(
                 pass
 
             try:
+                hit_cap.reset()
                 sb.open(target)
             except Exception as e:
                 print(f"[{visit_id}] Open failed: {e}")
@@ -980,16 +990,20 @@ def _visit_with_proxy_impl(
             is_bounce = target_duration < 25
             print(f"[{visit_id}] Target duration: {target_duration:.0f}s ({'bounce' if is_bounce else 'read'})")
 
+            # Yandex Direct ads to Telegram/app-store have no Metrika counter —
+            # a hit is impossible; don't waste the visit waiting for one.
+            if host_has_no_metrika(final_host):
+                print(f"[{visit_id}] No-Metrika destination ({final_host}); not counted")
+                return _visit_result(True, False, started_at, "no_metrika_counter")
+
             # Wait for Metrika to load — passive, no synthetic JS trigger.
             metrika_ready = _metrika_loaded(sb)
             print(f"[{visit_id}] Metrika {'loaded' if metrika_ready else 'not loaded'}")
 
-            hit_ok = False
-            if metrika_ready:
-                # Natural hit: just wait; ym() fires automatically on page load.
-                hit_ok = _wait_for_metrika_hit(sb, timeout=METRIKA_HIT_TIMEOUT)
-
-            print(f"[{visit_id}] Metrika hit status: {'VERIFIED' if hit_ok else 'NOT FOUND'}")
+            # Poll the network-layer capture for a real /watch beacon.
+            hit_ok = hit_cap.wait_for_hit(timeout=METRIKA_HIT_TIMEOUT, stop_flag=lambda: STOP_FLAG)
+            print(f"[{visit_id}] Metrika hit status: {'VERIFIED' if hit_ok else 'NOT FOUND'} "
+                  f"(watch={hit_cap.watch_count})")
 
             # Bounce visits exit immediately after Metrika fires (or times out).
             if is_bounce:
@@ -1014,10 +1028,12 @@ def _visit_with_proxy_impl(
                 if not _simulate_human_read(sb, read_min, read_max):
                     return _visit_result(False, hit_ok, started_at, "human_sim_failed")
 
-            # Final Metrika check if not yet verified
+            # Final check: capture ran through all human behavior; a /watch
+            # beacon fired at any point during the visit counts as verified.
             if not hit_ok:
-                hit_ok = _wait_for_metrika_hit(sb, timeout=METRIKA_HIT_TIMEOUT)
-                print(f"[{visit_id}] Final Metrika check: {'VERIFIED' if hit_ok else 'NOT FOUND'}")
+                hit_ok = hit_cap.watch_count > 0
+                print(f"[{visit_id}] Final Metrika check: {'VERIFIED' if hit_ok else 'NOT FOUND'} "
+                      f"(watch={hit_cap.watch_count})")
 
             # Final URL
             try:

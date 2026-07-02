@@ -145,7 +145,8 @@ async def worker_loop_v2(
                 )
 
                 success = bool(final_result.get("success"))
-                if success:
+                if bool(final_result.get("hit_verified")) or \
+                        final_result.get("error") == "no_metrika_counter":
                     break
 
         finally:
@@ -157,7 +158,7 @@ async def worker_loop_v2(
         hit_verified = bool(final_result.get("hit_verified"))
         error = final_result.get("error")
 
-        if success:
+        if hit_verified:
             try:
                 accepted = await increment_click(task["id"])
                 if not accepted:
