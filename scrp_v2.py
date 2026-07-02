@@ -511,7 +511,7 @@ def _has_metrika_hit_signal(sb: SB) -> bool:
 
     Signal priority (fastest/most-reliable first):
       1. window._ymHitDetected — set by the JS interceptor injected via
-         Page.addScriptToEvaluateOnNewDocument in _apply_fingerprint().
+         Page.addScriptToEvaluateOnNewDocument in _apply_cdp_fingerprint().
          Catches fetch/XHR/sendBeacon/Image.src the moment they're called,
          before the request even leaves the browser. Most reliable.
       2. performance.getEntriesByType('resource') — catches mc.yandex /watch
@@ -650,22 +650,108 @@ def _wait_for_security_verification(sb: SB, visit_id: int, timeout: float = 60.0
     return False
 
 
-def _apply_fingerprint(sb, profile: dict) -> None:
+def _accept_language_header(langs: list[str]) -> str:
     """
-    Apply a device profile's fingerprint to the browser session via CDP.
+    Build an Accept-Language header value from a profile's language list.
 
-    Must be called after the browser starts but before any page loads.
-    Page.addScriptToEvaluateOnNewDocument persists the overrides across
-    every page loaded in this session (prewarm + target + any redirect).
+    e.g. ["uz-UZ","uz","ru-RU","ru","en-US","en"]
+      -> "uz-UZ,uz;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6"
+    """
+    if not langs:
+        return "en-US,en;q=0.9"
+    header = langs[0]
+    for i, lang in enumerate(langs[1:5]):
+        header += f",{lang};q={round(1.0 - (i + 1) * 0.1, 1)}"
+    return header
 
-    What Yandex Metrica collects and what we fix:
-      - navigator.userAgent / platform / language / hardwareConcurrency /
-        deviceMemory / maxTouchPoints  →  overridden per profile
-      - screen.width / height / colorDepth  →  overridden per profile
+
+def _build_ua_metadata(profile: dict, mycdp):
+    """
+    Build CDP UserAgentMetadata (Client Hints) from a device profile.
+
+    Without this, Chrome leaks the real OS ('Linux' on the server) through the
+    Sec-CH-UA-Platform / Sec-CH-UA header set — even when the User-Agent STRING
+    says Windows/macOS. Yandex Metrika reads these hints, so we override them to
+    match the spoofed device. The underlying engine is always Chromium, so all
+    profiles (including the Firefox/Safari UAs) advertise Chromium brands; only
+    the OS/platform differs per profile.
+    """
+    import re
+
+    ua = profile["user_agent"]
+    plat = profile.get("platform", "Win32")
+
+    if "Win" in plat:
+        ch_platform = "Windows"
+        platform_version = "15.0.0"  # Win10/11 report high UA-CH platform versions
+        architecture = "x86"
+    else:  # Mac
+        ch_platform = "macOS"
+        m = re.search(r"Mac OS X (\d+[_.]\d+(?:[_.]\d+)?)", ua)
+        platform_version = m.group(1).replace("_", ".") if m else "13.5.0"
+        renderer = profile.get("webgl", {}).get("renderer", "")
+        architecture = "arm" if "Apple M" in renderer else "x86"
+
+    cm = re.search(r"Chrome/(\d+)", ua)
+    chrome_major = cm.group(1) if cm else "131"
+    full_version = f"{chrome_major}.0.0.0"
+
+    UABV = mycdp.emulation.UserAgentBrandVersion
+    not_a = "Not?A_Brand"
+    if "Edg/" in ua:
+        em = re.search(r"Edg/(\d+)", ua)
+        edge_major = em.group(1) if em else chrome_major
+        brands = [
+            UABV(brand="Chromium", version=chrome_major),
+            UABV(brand="Microsoft Edge", version=edge_major),
+            UABV(brand=not_a, version="24"),
+        ]
+        full_version_list = [
+            UABV(brand="Chromium", version=full_version),
+            UABV(brand="Microsoft Edge", version=f"{edge_major}.0.0.0"),
+            UABV(brand=not_a, version="24.0.0.0"),
+        ]
+    else:
+        brands = [
+            UABV(brand="Chromium", version=chrome_major),
+            UABV(brand="Google Chrome", version=chrome_major),
+            UABV(brand=not_a, version="24"),
+        ]
+        full_version_list = [
+            UABV(brand="Chromium", version=full_version),
+            UABV(brand="Google Chrome", version=full_version),
+            UABV(brand=not_a, version="24.0.0.0"),
+        ]
+
+    return mycdp.emulation.UserAgentMetadata(
+        platform=ch_platform,
+        platform_version=platform_version,
+        architecture=architecture,
+        model="",
+        mobile=False,
+        brands=brands,
+        full_version_list=full_version_list,
+        full_version=full_version,
+        bitness="64",
+        wow64=False,
+    )
+
+
+def _build_fingerprint_script(profile: dict) -> str:
+    """
+    Build the persistent JS fingerprint-override script for a device profile.
+
+    Registered via Page.addScriptToEvaluateOnNewDocument on the CDP-mode
+    connection so it runs before any page script on every document loaded in the
+    session (target + any redirect). It overrides what Yandex Metrica collects:
+
+      - navigator.userAgent / platform / language / languages /
+        hardwareConcurrency / deviceMemory / maxTouchPoints  →  per profile
+      - screen.width / height / colorDepth  →  per profile
       - window.innerHeight  →  CRITICAL: real browsers subtract ~135px for
         browser chrome; headless bots show innerHeight == screen.height (ratio 1.0)
-      - WebGL UNMASKED_VENDOR / RENDERER  →  overridden with real GPU strings
-      - Timezone  →  set via Emulation CDP domain
+      - WebGL UNMASKED_VENDOR / RENDERER  →  real GPU strings
+    It also installs the Yandex Metrika hit interceptor used for hit detection.
     """
     nav = profile["navigator"]
     scr = profile["screen"]
@@ -677,25 +763,7 @@ def _apply_fingerprint(sb, profile: dict) -> None:
     chrome_ui_px = 135 if "Win32" in profile.get("platform", "Win32") else 115
     inner_height = max(500, scr["height"] - chrome_ui_px)
 
-    # 1. User-Agent override (also sets HTTP User-Agent header)
-    try:
-        sb.execute_cdp_cmd("Network.setUserAgentOverride", {
-            "userAgent": profile["user_agent"],
-            "platform": profile["platform"],
-        })
-    except Exception:
-        pass
-
-    # 2. Timezone override
-    try:
-        sb.execute_cdp_cmd("Emulation.setTimezoneOverride", {
-            "timezoneId": profile["timezone"],
-        })
-    except Exception:
-        pass
-
-    # 3. Build persistent fingerprint script.
-    #    Pre-serialise Python values to JSON to avoid f-string brace escaping.
+    # Pre-serialise Python values to JSON to avoid f-string brace escaping.
     nav_json = json.dumps({
         "userAgent":           nav["userAgent"],
         "appVersion":          nav["appVersion"],
@@ -784,16 +852,70 @@ def _apply_fingerprint(sb, profile: dict) -> None:
         "})();"
     )
 
-    try:
-        sb.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": fp_script})
-    except Exception:
-        pass
+    return fp_script
 
-    # 4. Resize the physical browser window to match the profile's screen
+
+def _apply_cdp_fingerprint(
+    sb, profile: dict, referer_url: str, accept_language: str
+) -> None:
+    """
+    Apply the device-profile fingerprint on the ACTIVE CDP-mode connection.
+
+    Must run AFTER activate_cdp_mode() and BEFORE opening the target URL.
+
+    Why here (and not before CDP mode): SeleniumBase tears down the webdriver
+    DevTools session when it enters CDP mode, which DISCARDS any overrides set
+    via sb.execute_cdp_cmd() beforehand. That is exactly why the device profile
+    never took effect — Chrome fell back to its real (Linux) identity + en-US.
+    These CDP commands are issued on the connection that actually loads the
+    target, so they persist for the visit.
+    """
+    import mycdp
+    import mycdp.network
+    import mycdp.emulation
+    import mycdp.page
+
+    loop = sb.cdp.loop
+    page = sb.cdp.page
+
+    def send(cmd):
+        try:
+            loop.run_until_complete(page.send(cmd))
+        except Exception:
+            pass
+
+    send(mycdp.network.enable())
+    send(mycdp.page.enable())
+
+    # 1. User-Agent string + navigator.platform + Client Hints (Sec-CH-UA-*).
+    #    The Client Hints metadata is what stops 'Linux' from leaking on the
+    #    server regardless of the spoofed User-Agent string.
     try:
-        sb.set_window_size(vp["width"], vp["height"])
+        ua_meta = _build_ua_metadata(profile, mycdp)
     except Exception:
-        pass
+        ua_meta = None
+    send(mycdp.network.set_user_agent_override(
+        user_agent=profile["user_agent"],
+        accept_language=accept_language,
+        platform=profile["platform"],
+        user_agent_metadata=ua_meta,
+    ))
+
+    # 2. Timezone (Metrika reads the resolved IANA zone).
+    send(mycdp.emulation.set_timezone_override(timezone_id=profile["timezone"]))
+
+    # 3. navigator / screen / WebGL / innerHeight overrides + Metrika interceptor.
+    send(mycdp.page.add_script_to_evaluate_on_new_document(
+        source=_build_fingerprint_script(profile)
+    ))
+
+    # 4. Referer + full Accept-Language header for the target request.
+    send(mycdp.network.set_extra_http_headers(
+        headers=mycdp.network.Headers({
+            "Referer": referer_url,
+            "Accept-Language": accept_language,
+        })
+    ))
 
 
 def _visit_with_proxy_impl(
@@ -825,6 +947,13 @@ def _visit_with_proxy_impl(
         # Pick a device profile for this visit (varies fingerprint across workers)
         profile = pick_profile()
 
+        # Language for this device: primary locale (e.g. "uz-UZ") drives the
+        # browser's --lang / navigator.language; the full list builds the
+        # Accept-Language header. These are the values Metrika reports as the
+        # visitor language — NOT the server's default en-US.
+        primary_locale = profile["navigator"].get("language", "uz-UZ")
+        accept_language = _accept_language_header(profile["navigator"]["languages"])
+
         # Dynamic Referer based on domain TLD
         if tld == 'uz':
             referer_url = f"https://yandex.uz/search/?text={domain}"
@@ -848,6 +977,13 @@ def _visit_with_proxy_impl(
             headless=False,
             page_load_strategy="eager",
             test=True,
+            # Bake the device identity into the browser at launch:
+            #   agent       -> --user-agent flag (every request uses this UA)
+            #   locale_code -> intl.accept_languages pref + CDP locale override
+            # These survive the switch into CDP mode (unlike execute_cdp_cmd
+            # overrides), so the server's native Linux UA / en-US never surface.
+            agent=profile["user_agent"],
+            locale_code=primary_locale,
         ) as sb:
             if STOP_FLAG:
                 return _visit_result(False, False, started_at, "stopped")
@@ -870,33 +1006,11 @@ def _visit_with_proxy_impl(
             except Exception:
                 pass
 
-            # Apply device fingerprint BEFORE any page load so the script
-            # is registered for both the prewarm URL and the target URL.
-            try:
-                _apply_fingerprint(sb, profile)
-            except Exception:
-                pass
-
-            # Build Accept-Language from profile's language list
-            _langs = profile["navigator"]["languages"]
-            _lang_header = _langs[0] + "".join(
-                f",{lang};q={round(1.0 - (i + 1) * 0.1, 1)}"
-                for i, lang in enumerate(_langs[1:5])
-            )
-
-            # Set custom headers (Referer + profile-specific Accept-Language)
-            try:
-                sb.execute_cdp_cmd(
-                    "Network.setExtraHTTPHeaders",
-                    {
-                        "headers": {
-                            "Referer": referer_url,
-                            "Accept-Language": _lang_header,
-                        }
-                    },
-                )
-            except Exception:
-                pass
+            # NOTE: The device fingerprint (UA / navigator / screen / WebGL /
+            # timezone / Client Hints / Referer / Accept-Language) is applied
+            # AFTER activate_cdp_mode() via _apply_cdp_fingerprint(), because
+            # overrides set here (pre-CDP) would be discarded when SeleniumBase
+            # tears down the webdriver session to enter CDP mode.
 
             # Inject Yandex-global cookies before the Yandex prewarm so the
             # prewarm page sees a stable Yandex-side visitor identity.
@@ -915,6 +1029,17 @@ def _visit_with_proxy_impl(
                 sb.activate_cdp_mode(PREWARM_URL)
             except Exception:
                 pass
+
+            # Apply the full device fingerprint on the live CDP connection.
+            # This is what the target site + its Metrika counter actually see:
+            # the profile's UA, platform, language, screen, WebGL, timezone and
+            # Client Hints — instead of the server's real Linux / en-US identity.
+            try:
+                _apply_cdp_fingerprint(sb, profile, referer_url, accept_language)
+                print(f"[{visit_id}] Applied device fingerprint: {profile['name']} "
+                      f"| lang={primary_locale}")
+            except Exception as _fp_err:
+                print(f"[{visit_id}] Fingerprint apply failed: {_fp_err}")
 
             if not _sleep_range(PREWARM_DELAY):
                 return _visit_result(False, False, started_at, "stopped")
