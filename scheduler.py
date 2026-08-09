@@ -32,7 +32,7 @@ CYCLE_TIMES = [(8, 0), (10, 0), (12, 0), (14, 0), (16, 0),
                (18, 0), (20, 0), (22, 0), (23, 59)]
 
 VIEWS_PER_BLOCK = 100      # every full 100 new views ...
-VISITS_PER_BLOCK = 1       # ... yields 1 visit (= 1%)
+VISITS_PER_BLOCK = 2       # ... yields 1 visit (= 1%)
 NUM_WORKERS = 5
 
 # Shared auto-run state (read by bot.py for the 📡 Auto status display)
