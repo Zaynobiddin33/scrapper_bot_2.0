@@ -15,9 +15,11 @@ from telethon.tl.types import (
 
 TASHKENT_TZ = timezone(timedelta(hours=5))
 _URL_RE = re.compile(r'https?://[^\s<>"\'\]\)\,]+')
-# Strict hashtag: exactly #reklama, not #reklamada / #reklama_uz / #reklamapost.
-# The negative lookahead rejects any following word char (letters, digits, _).
-_REKLAMA_RE = re.compile(r'#reklama(?!\w)', re.IGNORECASE)
+# Strict hashtag: exactly #reklama or its Cyrillic form #реклама — not
+# #reklamada / #reklama_uz / #reklamapost / #рекламада.
+# The negative lookahead rejects any following word char (letters, digits, _);
+# \w is Unicode-aware on str patterns, so it blocks Cyrillic suffixes too.
+_REKLAMA_RE = re.compile(r'#(?:reklama|реклама)(?!\w)', re.IGNORECASE)
 
 
 def build_telethon_proxy():
