@@ -32,8 +32,12 @@ CYCLE_TIMES = [(8, 0), (10, 0), (12, 0), (14, 0), (16, 0),
                (18, 0), (20, 0), (22, 0), (23, 59)]
 
 VIEWS_PER_BLOCK = 100      # every full 100 new views ...
-VISITS_PER_BLOCK = 2       # ... yields 1 visit (= 1%)
+VISITS_PER_BLOCK = 2       # ... yields 2 visits (= 2%)
 NUM_WORKERS = 5
+
+# Report delivery hardening: a failed send used to vanish without a trace.
+NOTIFY_RETRIES = 3
+NOTIFY_RETRY_DELAY = 3.0
 
 # Shared auto-run state (read by bot.py for the 📡 Auto status display)
 auto_run_info: dict = {
@@ -129,10 +133,17 @@ async def _do_reklama_cycle(bot, admin_ids, api_id, api_hash, session_string, ch
 
     async def notify(text: str):
         for uid in admin_ids:
-            try:
-                await bot.send_message(uid, text, parse_mode="HTML")
-            except Exception:
-                pass
+            for attempt in range(NOTIFY_RETRIES):
+                try:
+                    await bot.send_message(uid, text, parse_mode="HTML")
+                    break
+                except Exception as exc:
+                    if attempt + 1 >= NOTIFY_RETRIES:
+                        print(f"[scheduler] NOTIFY FAILED uid={uid} after "
+                              f"{NOTIFY_RETRIES} attempts: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
+                    else:
+                        await asyncio.sleep(NOTIFY_RETRY_DELAY * (attempt + 1))
 
     # First cycle of a new day → reset queue + old ledger so counting restarts.
     if await ledger_count_for_date(run_date) == 0:

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 TASHKENT_TZ = timezone(timedelta(hours=5))
 
 from aiogram import Bot, Router, types, BaseMiddleware
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.dispatcher.dispatcher import Dispatcher as AiogramDispatcher
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -72,7 +73,9 @@ class AuthMiddleware(BaseMiddleware):
 
 
 # ==================== BOT SETUP ====================
-bot = Bot(token=BOT_TOKEN)
+# 15s instead of aiogram's 60s default: if the route to api.telegram.org
+# breaks again, a report fails fast and loudly, not 60s per admin in silence.
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=15))
 storage = MemoryStorage()
 dp = AiogramDispatcher(storage=storage)
 router = Router()

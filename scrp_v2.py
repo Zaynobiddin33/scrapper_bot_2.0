@@ -141,7 +141,7 @@ def cleanup_chrome():
             for child in current.children(recursive=True):
                 try:
                     name = child.name().lower()
-                    if any(x in name for x in ["chrome", "chromedriver", "geckodriver", "firefox"]):
+                    if any(x in name for x in ["chrome", "chromedriver", "geckodriver", "firefox", "xvfb"]):
                         child.kill()  # Force kill
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     pass
